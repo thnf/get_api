@@ -47,7 +47,8 @@ class APIFetcher(Star):
         # 插件配置（AstrBot 会在实例化时传入配置对象）
         self.config = config or {}
         self.api_url = str(self.config.get("api_url", "")).strip()
-        self.interval = int(self.config.get("interval", 3600))
+        # 间隔最小为 1 秒，防止无睡眠导致忙循环
+        self.interval = max(1, int(self.config.get("interval", 3600)))
         self.target_session = str(self.config.get("target_session", "")).strip()
         self.message_template = str(self.config.get("message_template", "{data}"))
         # 调度模式: 'interval' 或 'daily'
@@ -156,3 +157,9 @@ class APIFetcher(Star):
                     await asyncio.sleep(self.interval)
             except Exception as e:
                 logger.error(f"api_fetcher: schedule wait error: {e}")
+                # 出现异常时短暂等待，避免进入紧密/无限循环
+                try:
+                    await asyncio.sleep(10)
+                except Exception:
+                    # 如果被取消或其他问题，继续循环以响应 terminate
+                    pass
