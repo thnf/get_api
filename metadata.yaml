@@ -1,0 +1,6 @@
+name: "api_fetcher"
+author: "YourName"
+desc: "定时从指定API获取数据并推送到指定会话"
+version: "1.0.0"
+repo: "https://github.com/yourusername/astrbot_plugin_api_fetcher"
+plugin_type: "platform"
