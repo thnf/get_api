@@ -121,62 +121,116 @@ class APIFetcher(Star):
         """后台调度任务：按间隔拉取 API 并在检测到新内容时推送。"""
         # 初次延迟 3 秒，以便 AstrBot 其余部分完成初始化
         await asyncio.sleep(3)
-        while self._running:
-            try:
-                if not self.api_url or not self.target_session:
-                    logger.warning("api_fetcher: api_url or target_session not set in config, waiting...")
-                    await asyncio.sleep(10)
-                    continue
-
-                # 根据调度类型执行一次拉取
-                raw = await self._fetch_api()
-                # 简单过滤：空响应则跳过
-                if raw is None or raw.strip() == "":
-                    logger.info("api_fetcher: empty response, skip")
-                else:
-                    current_hash = self._hash_text(raw)
-                    if current_hash == self._last_hash:
-                        logger.debug("api_fetcher: content unchanged, skip sending")
-                    else:
-                        text = self._format_message(raw)
-                        sent = await self._send_message_to_session(text)
-                        if sent:
-                            self._last_hash = current_hash
-                        # 如果不发送成功也不抛，让下次继续重试
-            except Exception as e:
-                logger.error(f"api_fetcher: scheduler error: {e}")
-            # 计算下一次等待时间：根据 schedule_type
-            try:
-                if self.schedule_type == 'daily':
-                    # daily_time 格式应为 HH:MM
-                    hh_mm = self.daily_time.split(":")
-                    if len(hh_mm) != 2:
-                        logger.error(f"api_fetcher: invalid daily_time format: {self.daily_time}, fallback to interval")
-                        await asyncio.sleep(self.interval)
+        # 采用明确的两条分支：daily 模式与 interval 模式
+        if self.schedule_type == 'daily':
+            logger.info(f"api_fetcher: scheduler started in DAILY mode (daily_time={self.daily_time})")
+            # daily 模式：每次循环先等待到下一个指定时间点，再执行一次拉取
+            while self._running:
+                try:
+                    # 校验配置
+                    if not self.api_url or not self.target_session:
+                        logger.warning("api_fetcher: api_url or target_session not set in config, waiting 10s...")
+                        await asyncio.sleep(10)
                         continue
-                    hour = int(hh_mm[0])
-                    minute = int(hh_mm[1])
+
+                    # 解析 daily_time
+                    try:
+                        hh_mm = self.daily_time.split(":")
+                        if len(hh_mm) != 2:
+                            raise ValueError("daily_time format must be HH:MM")
+                        hour = int(hh_mm[0])
+                        minute = int(hh_mm[1])
+                    except Exception as e:
+                        logger.error(f"api_fetcher: invalid daily_time '{self.daily_time}': {e}")
+                        await asyncio.sleep(10)
+                        continue
+
                     now = datetime.now()
-                    target_today = datetime.combine(now.date(), dtime(hour=hour, minute=minute))
-                    if target_today <= now:
-                        # 已过今日时间，排到明天
-                        target_today = target_today + timedelta(days=1)
-                    sleep_seconds = (target_today - now).total_seconds()
-                    logger.info(f"api_fetcher: next daily run in {int(sleep_seconds)} seconds (at {target_today.isoformat()})")
-                    # 分段睡眠以便能响应 terminate 请求
+                    target = datetime.combine(now.date(), dtime(hour=hour, minute=minute))
+                    if target <= now:
+                        target = target + timedelta(days=1)
+                    sleep_seconds = (target - now).total_seconds()
+                    logger.info(f"api_fetcher: sleeping {int(sleep_seconds)}s until next daily run at {target.isoformat()}")
+
+                    # 分段等待以支持优雅终止
                     remained = sleep_seconds
                     while remained > 0 and self._running:
                         step = min(remained, 60)
                         await asyncio.sleep(step)
                         remained -= step
-                else:
-                    # 默认按间隔
-                    await asyncio.sleep(self.interval)
-            except Exception as e:
-                logger.error(f"api_fetcher: schedule wait error: {e}")
-                # 出现异常时短暂等待，避免进入紧密/无限循环
-                try:
+
+                    if not self._running:
+                        break
+
+                    # 到点，执行一次拉取与发送
+                    try:
+                        logger.info("api_fetcher: daily trigger - fetching API...")
+                        raw = await self._fetch_api()
+                    except Exception as e:
+                        logger.error(f"api_fetcher: fetch error on daily trigger: {e}")
+                        # 等到下一次再试
+                        continue
+
+                    if raw is None or raw.strip() == "":
+                        logger.info("api_fetcher: daily fetch returned empty, skip")
+                        continue
+
+                    try:
+                        current_hash = self._hash_text(raw)
+                        if current_hash == self._last_hash:
+                            logger.debug("api_fetcher: daily content unchanged, skip sending")
+                        else:
+                            text = self._format_message(raw)
+                            sent = await self._send_message_to_session(text)
+                            if sent:
+                                self._last_hash = current_hash
+                    except Exception as e:
+                        logger.error(f"api_fetcher: daily process/send error: {e}")
+
+                except Exception as e:
+                    logger.error(f"api_fetcher: unexpected error in daily scheduler: {e}")
                     await asyncio.sleep(10)
-                except Exception:
-                    # 如果被取消或其他问题，继续循环以响应 terminate
-                    pass
+
+        else:
+            logger.info(f"api_fetcher: scheduler started in INTERVAL mode (interval={self.interval}s)")
+            # interval 模式：每隔 interval 秒执行一次（先等待 interval 后执行），避免启动即触发
+            while self._running:
+                try:
+                    if not self.api_url or not self.target_session:
+                        logger.warning("api_fetcher: api_url or target_session not set in config, waiting 10s...")
+                        await asyncio.sleep(10)
+                        continue
+
+                    # 等待 interval
+                    await asyncio.sleep(self.interval)
+
+                    if not self._running:
+                        break
+
+                    # 执行拉取与发送
+                    try:
+                        logger.info("api_fetcher: interval trigger - fetching API...")
+                        raw = await self._fetch_api()
+                    except Exception as e:
+                        logger.error(f"api_fetcher: fetch error on interval trigger: {e}")
+                        continue
+
+                    if raw is None or raw.strip() == "":
+                        logger.info("api_fetcher: interval fetch returned empty, skip")
+                        continue
+
+                    try:
+                        current_hash = self._hash_text(raw)
+                        if current_hash == self._last_hash:
+                            logger.debug("api_fetcher: interval content unchanged, skip sending")
+                        else:
+                            text = self._format_message(raw)
+                            sent = await self._send_message_to_session(text)
+                            if sent:
+                                self._last_hash = current_hash
+                    except Exception as e:
+                        logger.error(f"api_fetcher: interval process/send error: {e}")
+
+                except Exception as e:
+                    logger.error(f"api_fetcher: unexpected error in interval scheduler: {e}")
+                    await asyncio.sleep(10)
