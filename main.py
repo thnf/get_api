@@ -27,7 +27,7 @@ from datetime import datetime, time as dtime, timedelta
 import httpx
 
 from astrbot.api import logger
-from astrbot.api.event import MessageChain
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 
 
@@ -63,6 +63,23 @@ class APIFetcher(Star):
 
         # 如果用户没有填写必要配置，仍然不抛异常，但 scheduler 会跳过执行并每 10s 检查一次配置
         asyncio.create_task(self._scheduler())
+
+    @filter.command("showumo")
+    async def show_unified_origin(self, event: AstrMessageEvent):
+        """调试用：在当前会话回显 unified_msg_origin、platform 与 message_type。"""
+        try:
+            umo = event.unified_msg_origin
+        except Exception:
+            umo = "unknown"
+        try:
+            platform = event.get_platform_name()
+        except Exception:
+            platform = "unknown"
+        try:
+            mtype = str(event.get_message_type())
+        except Exception:
+            mtype = "unknown"
+        yield event.plain_result(f"unified_msg_origin: {umo}\nplatform: {platform}\nmessage_type: {mtype}")
 
     async def terminate(self):
         """当插件被卸载/停用时调用，退出后台任务。"""
