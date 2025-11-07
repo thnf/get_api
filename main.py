@@ -1,260 +1,158 @@
+# -*- coding: utf-8 -*-
 """
-AstrBot 定时API获取插件
-定时从指定API获取数据并推送到指定会话
+astrbot_plugin_api_fetcher
+定时拉取第三方 API 并将结果主动推送到指定会话（unified_msg_origin）。
+
+注意事项：
+- 推荐把此目录放到 AstrBot 的 data/plugins 下并通过 AstrBot 管理面板启用。
+- 插件可配置项位于 `_conf_schema.json`（由 AstrBot 在 data/config 中保存实际配置）。
+- 本插件使用 httpx 进行异步请求（异步库），请在 `requirements.txt` 中声明依赖。
+
+简单实现要点：
+- 插件继承自 Star
+- 在 __init__ 中启动一个 asyncio 任务作为 scheduler
+- 使用 self.context.send_message(session, message_chain) 主动发送消息
+- 实现 terminate() 以便停用时干净退出
+
 """
+
 import asyncio
 import json
-from datetime import datetime
+import os
+import hashlib
+import time
 from typing import Optional
+from datetime import datetime, time as dtime, timedelta
 
-import aiohttp
-import astrbot.api.message_components as Comp
-from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+import httpx
+
+from astrbot.api import logger
+from astrbot.api.event import MessageChain
 from astrbot.api.star import Context, Star, register
 
 
-@register(
-    "api_fetcher",
-    "YourName",
-    "定时获取API内容并推送的插件",
-    "1.0.0",
-    "https://github.com/thnf/get_api"
-)
-class APIFetcherPlugin(Star):
-    """定时API获取插件"""
+@register("api_fetcher", "你的名字", "定时拉取 API 并推送结果的示例插件", "1.0.0", "https://example.com/repo")
+class APIFetcher(Star):
+    """定时拉取 API 并主动发送到指定会话的插件。
 
-    def __init__(self, context: Context, config: AstrBotConfig):
+    配置项在 `_conf_schema.json` 中定义。常用字段：
+      - api_url: 要拉取的 API 地址（string）
+      - interval: 拉取间隔，单位秒（int，默认 3600）
+      - target_session: 要发送到的 unified_msg_origin（string，例如 aiocqhttp:group:123456 或 aiocqhttp:private:123456）
+      - message_template: 格式化消息的模版，支持占位 {data}（string）
+    """
+
+    def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
-        self.config = config
-        
-        # 从配置文件读取参数
-        self.api_url = config.get("api_url", "")
-        self.fetch_interval = config.get("fetch_interval", 3600)  # 默认1小时
-        self.enabled = config.get("enabled", False)
-        self.target_sessions = config.get("target_sessions", [])  # 推送目标会话列表
-        self.message_template = config.get("message_template", "API更新:\n{content}")
-        self.headers = config.get("headers", {})
-        self.request_method = config.get("request_method", "GET")
-        self.request_body = config.get("request_body", {})
-        
-        # 任务控制
-        self.fetch_task: Optional[asyncio.Task] = None
-        self.is_running = False
-        
-        # 启动定时任务
-        if self.enabled and self.api_url:
-            asyncio.create_task(self.start_fetch_task())
-            logger.info(f"API定时任务已启动,间隔: {self.fetch_interval}秒")
-        else:
-            logger.info("API定时任务未启用或API地址未配置")
+        # 插件配置（AstrBot 会在实例化时传入配置对象）
+        self.config = config or {}
+        self.api_url = str(self.config.get("api_url", "")).strip()
+        self.interval = int(self.config.get("interval", 3600))
+        self.target_session = str(self.config.get("target_session", "")).strip()
+        self.message_template = str(self.config.get("message_template", "{data}"))
+        # 调度模式: 'interval' 或 'daily'
+        self.schedule_type = str(self.config.get("schedule_type", "interval")).strip()
+        # 当 schedule_type == 'daily' 时，使用 daily_time，格式 HH:MM
+        self.daily_time = str(self.config.get("daily_time", "00:00")).strip()
 
-    async def start_fetch_task(self):
-        """启动定时获取任务"""
-        self.is_running = True
-        while self.is_running:
-            try:
-                await self.fetch_and_send()
-            except Exception as e:
-                logger.error(f"定时任务执行失败: {e}")
-            
-            # 等待下一次执行
-            await asyncio.sleep(self.fetch_interval)
+        # 内存中记录上一次已发送的内容哈希，用于简单去重（重启失效）。
+        self._last_hash = None
+        # 控制任务运行
+        self._running = True
 
-    async def fetch_api(self) -> dict:
-        """
-        从API获取数据
-        
-        Returns:
-            dict: API返回的JSON数据
-        """
-        async with aiohttp.ClientSession() as session:
-            try:
-                if self.request_method.upper() == "GET":
-                    async with session.get(
-                        self.api_url,
-                        headers=self.headers,
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        response.raise_for_status()
-                        return await response.json()
-                else:  # POST
-                    async with session.post(
-                        self.api_url,
-                        headers=self.headers,
-                        json=self.request_body,
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        response.raise_for_status()
-                        return await response.json()
-            except aiohttp.ClientError as e:
-                logger.error(f"API请求失败: {e}")
-                raise
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON解析失败: {e}")
-                raise
-
-    def format_message(self, data: dict) -> str:
-        """
-        格式化API返回的数据为消息文本
-        
-        Args:
-            data: API返回的数据
-            
-        Returns:
-            str: 格式化后的消息文本
-        """
-        try:
-            # 尝试使用模板格式化
-            content = json.dumps(data, ensure_ascii=False, indent=2)
-            return self.message_template.format(
-                content=content,
-                time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                **data  # 允许在模板中使用数据字段
-            )
-        except Exception as e:
-            logger.error(f"消息格式化失败: {e}")
-            # 降级为简单格式
-            return f"API数据更新 [{datetime.now().strftime('%H:%M:%S')}]\n{json.dumps(data, ensure_ascii=False, indent=2)}"
-
-    async def fetch_and_send(self):
-        """获取API数据并发送到目标会话"""
-        try:
-            # 获取API数据
-            data = await self.fetch_api()
-            logger.info(f"成功获取API数据")
-            
-            # 格式化消息
-            message_text = self.format_message(data)
-            
-            # 构建消息链
-            message_chain = MessageChain().message(message_text)
-            
-            # 发送到所有目标会话
-            if not self.target_sessions:
-                logger.warning("未配置推送目标会话")
-                return
-                
-            for session_id in self.target_sessions:
-                try:
-                    await self.context.send_message(session_id, message_chain)
-                    logger.info(f"已推送消息到会话: {session_id}")
-                except Exception as e:
-                    logger.error(f"推送消息到 {session_id} 失败: {e}")
-                    
-        except Exception as e:
-            logger.error(f"fetch_and_send执行失败: {e}")
-
-    @filter.command("apifetch")
-    async def manual_fetch(self, event: AstrMessageEvent):
-        """手动触发获取API数据"""
-        if not self.api_url:
-            yield event.plain_result("❌ 未配置API地址")
-            return
-            
-        try:
-            yield event.plain_result("⏳ 正在获取API数据...")
-            
-            data = await self.fetch_api()
-            message_text = self.format_message(data)
-            
-            yield event.plain_result(message_text)
-            
-        except Exception as e:
-            yield event.plain_result(f"❌ 获取失败: {str(e)}")
-
-    @filter.command("apifetch", alias={"api状态"})
-    @filter.command_group("apifetch")
-    def apifetch_group(self):
-        """API获取插件命令组"""
-        pass
-
-    @apifetch_group.command("status")
-    async def fetch_status(self, event: AstrMessageEvent):
-        """查看定时任务状态"""
-        status_text = f"""
-📊 API获取插件状态
-
-🔗 API地址: {self.api_url or '未配置'}
-⏰ 获取间隔: {self.fetch_interval}秒
-🎯 推送目标: {len(self.target_sessions)}个会话
-▶️ 运行状态: {'运行中' if self.is_running else '已停止'}
-✅ 启用状态: {'已启用' if self.enabled else '已禁用'}
-        """.strip()
-        yield event.plain_result(status_text)
-
-    @apifetch_group.command("start")
-    async def start_task(self, event: AstrMessageEvent):
-        """启动定时任务"""
-        if self.is_running:
-            yield event.plain_result("⚠️ 定时任务已在运行中")
-            return
-            
-        if not self.api_url:
-            yield event.plain_result("❌ 未配置API地址,请先在配置文件中设置")
-            return
-            
-        self.is_running = True
-        asyncio.create_task(self.start_fetch_task())
-        yield event.plain_result("✅ 定时任务已启动")
-
-    @apifetch_group.command("stop")
-    async def stop_task(self, event: AstrMessageEvent):
-        """停止定时任务"""
-        if not self.is_running:
-            yield event.plain_result("⚠️ 定时任务未在运行")
-            return
-            
-        self.is_running = False
-        yield event.plain_result("✅ 定时任务已停止")
-
-    @apifetch_group.command("now")
-    async def fetch_now(self, event: AstrMessageEvent):
-        """立即执行一次获取"""
-        if not self.api_url:
-            yield event.plain_result("❌ 未配置API地址")
-            return
-            
-        try:
-            yield event.plain_result("⏳ 正在获取API数据...")
-            await self.fetch_and_send()
-            yield event.plain_result("✅ 数据已获取并推送")
-        except Exception as e:
-            yield event.plain_result(f"❌ 执行失败: {str(e)}")
-
-    @apifetch_group.command("addtarget")
-    async def add_target(self, event: AstrMessageEvent):
-        """将当前会话添加为推送目标"""
-        session_id = event.unified_msg_origin
-        
-        if session_id in self.target_sessions:
-            yield event.plain_result("⚠️ 当前会话已在推送列表中")
-            return
-            
-        self.target_sessions.append(session_id)
-        self.config["target_sessions"] = self.target_sessions
-        self.config.save_config()
-        
-        yield event.plain_result(f"✅ 已添加当前会话为推送目标\n当前共有 {len(self.target_sessions)} 个推送目标")
-
-    @apifetch_group.command("removetarget")
-    async def remove_target(self, event: AstrMessageEvent):
-        """将当前会话从推送目标中移除"""
-        session_id = event.unified_msg_origin
-        
-        if session_id not in self.target_sessions:
-            yield event.plain_result("⚠️ 当前会话不在推送列表中")
-            return
-            
-        self.target_sessions.remove(session_id)
-        self.config["target_sessions"] = self.target_sessions
-        self.config.save_config()
-        
-        yield event.plain_result(f"✅ 已移除当前会话\n当前共有 {len(self.target_sessions)} 个推送目标")
+        # 如果用户没有填写必要配置，仍然不抛异常，但 scheduler 会跳过执行并每 10s 检查一次配置
+        asyncio.create_task(self._scheduler())
 
     async def terminate(self):
-        """插件卸载时清理资源"""
-        self.is_running = False
-        if self.fetch_task and not self.fetch_task.done():
-            self.fetch_task.cancel()
-        logger.info("API获取插件已停止")
+        """当插件被卸载/停用时调用，退出后台任务。"""
+        self._running = False
+        # 给任务一点时间退出
+        await asyncio.sleep(0.1)
+
+    async def _fetch_api(self) -> str:
+        """使用 httpx 异步请求 API，返回文本结果。"""
+        timeout = httpx.Timeout(10.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(self.api_url)
+            r.raise_for_status()
+            return r.text
+
+    def _hash_text(self, s: str) -> str:
+        return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+    def _format_message(self, raw: str) -> str:
+        # 默认将 raw 文本替换到 message_template 的 {data} 位置
+        try:
+            return self.message_template.format(data=raw)
+        except Exception:
+            # 如果格式化失败则退回原文（截断到 1500 字以防过长）
+            return raw[:1500]
+
+    async def _send_message_to_session(self, text: str) -> bool:
+        # 构造 MessageChain 并调用 context.send_message
+        try:
+            chain = MessageChain().message(text)
+            ok = await self.context.send_message(self.target_session, chain)
+            logger.info(f"api_fetcher: send_message returned {ok}")
+            return bool(ok)
+        except Exception as e:
+            logger.error(f"api_fetcher: send_message error: {e}")
+            return False
+
+    async def _scheduler(self):
+        """后台调度任务：按间隔拉取 API 并在检测到新内容时推送。"""
+        # 初次延迟 3 秒，以便 AstrBot 其余部分完成初始化
+        await asyncio.sleep(3)
+        while self._running:
+            try:
+                if not self.api_url or not self.target_session:
+                    logger.warning("api_fetcher: api_url or target_session not set in config, waiting...")
+                    await asyncio.sleep(10)
+                    continue
+
+                # 根据调度类型执行一次拉取
+                raw = await self._fetch_api()
+                # 简单过滤：空响应则跳过
+                if raw is None or raw.strip() == "":
+                    logger.info("api_fetcher: empty response, skip")
+                else:
+                    current_hash = self._hash_text(raw)
+                    if current_hash == self._last_hash:
+                        logger.debug("api_fetcher: content unchanged, skip sending")
+                    else:
+                        text = self._format_message(raw)
+                        sent = await self._send_message_to_session(text)
+                        if sent:
+                            self._last_hash = current_hash
+                        # 如果不发送成功也不抛，让下次继续重试
+            except Exception as e:
+                logger.error(f"api_fetcher: scheduler error: {e}")
+            # 计算下一次等待时间：根据 schedule_type
+            try:
+                if self.schedule_type == 'daily':
+                    # daily_time 格式应为 HH:MM
+                    hh_mm = self.daily_time.split(":")
+                    if len(hh_mm) != 2:
+                        logger.error(f"api_fetcher: invalid daily_time format: {self.daily_time}, fallback to interval")
+                        await asyncio.sleep(self.interval)
+                        continue
+                    hour = int(hh_mm[0])
+                    minute = int(hh_mm[1])
+                    now = datetime.now()
+                    target_today = datetime.combine(now.date(), dtime(hour=hour, minute=minute))
+                    if target_today <= now:
+                        # 已过今日时间，排到明天
+                        target_today = target_today + timedelta(days=1)
+                    sleep_seconds = (target_today - now).total_seconds()
+                    logger.info(f"api_fetcher: next daily run in {int(sleep_seconds)} seconds (at {target_today.isoformat()})")
+                    # 分段睡眠以便能响应 terminate 请求
+                    remained = sleep_seconds
+                    while remained > 0 and self._running:
+                        step = min(remained, 60)
+                        await asyncio.sleep(step)
+                        remained -= step
+                else:
+                    # 默认按间隔
+                    await asyncio.sleep(self.interval)
+            except Exception as e:
+                logger.error(f"api_fetcher: schedule wait error: {e}")

@@ -1,54 +1,36 @@
 {
-  "enabled": {
-    "description": "启用定时任务",
-    "type": "bool",
-    "hint": "开启后将自动按设定间隔获取API数据并推送",
-    "default": false
-  },
   "api_url": {
-    "description": "API地址",
+    "description": "要拉取的 API 地址（完整 URL）",
     "type": "string",
-    "hint": "需要定时获取的API完整URL地址,例如: https://api.example.com/data",
-    "obvious_hint": true,
+    "hint": "例如 https://api.example.com/latest",
     "default": ""
   },
-  "fetch_interval": {
-    "description": "获取间隔(秒)",
+  "interval": {
+    "description": "拉取间隔（秒）",
     "type": "int",
-    "hint": "定时获取的时间间隔,单位为秒。例如: 3600表示每小时获取一次",
     "default": 3600
   },
-  "request_method": {
-    "description": "请求方法",
+  "schedule_type": {
+    "description": "调度类型，支持 \"interval\"（按间隔秒）或 \"daily\"（每天固定时间）",
     "type": "string",
-    "hint": "HTTP请求方法",
-    "default": "GET",
-    "options": ["GET", "POST"]
+    "options": ["interval", "daily"],
+    "default": "interval"
   },
-  "headers": {
-    "description": "请求头",
-    "type": "object",
-    "hint": "API请求需要的HTTP headers,JSON格式。例如添加认证token: {\"Authorization\": \"Bearer your_token\"}",
-    "items": {},
-    "default": {}
+  "daily_time": {
+    "description": "当 schedule_type 为 daily 时，指定每天执行的时间，格式 HH:MM（24小时制）",
+    "type": "string",
+    "default": "00:00",
+    "hint": "例如 09:30 表示每天 09:30 执行"
   },
-  "request_body": {
-    "description": "请求体(仅POST)",
-    "type": "object",
-    "hint": "POST请求时发送的数据,JSON格式",
-    "items": {},
-    "default": {}
+  "target_session": {
+    "description": "发送目标，会话统一 ID（unified_msg_origin）",
+    "type": "string",
+    "hint": "例如 aiocqhttp:group:123456 或 aiocqhttp:private:123456",
+    "default": ""
   },
   "message_template": {
-    "description": "消息模板",
+    "description": "发给目标会话的消息模版，使用 {data} 占位 API 返回的文本",
     "type": "text",
-    "hint": "推送消息的格式模板。可用变量:\n{content} - API返回的完整JSON数据\n{time} - 获取时间\n以及API返回数据中的任何字段,如{title}、{data}等",
-    "default": "📢 API数据更新\n⏰ 时间: {time}\n\n{content}"
-  },
-  "target_sessions": {
-    "description": "推送目标会话列表",
-    "type": "list",
-    "hint": "数据获取后推送到的会话ID列表。建议使用 /apifetch addtarget 命令添加当前会话",
-    "default": []
+    "default": "{data}"
   }
 }

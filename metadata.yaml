@@ -1,6 +1,5 @@
-name: "api_fetcher"
-author: "YourName"
-desc: "定时从指定API获取数据并推送到指定会话"
-version: "1.0.0"
+name: astrbot_plugin_api_fetcher
+author: 你的名字
+desc: 定时拉取某 API 并主动推送到指定会话的示例插件
+version: 1.0.0
 repo: "https://github.com/thnf/get_api"
-plugin_type: "platform"
