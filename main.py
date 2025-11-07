@@ -19,7 +19,7 @@ from astrbot.api.star import Context, Star, register
     "YourName",
     "定时获取API内容并推送的插件",
     "1.0.0",
-    "https://github.com/yourusername/astrbot_plugin_api_fetcher"
+    "https://github.com/thnf/get_api"
 )
 class APIFetcherPlugin(Star):
     """定时API获取插件"""
